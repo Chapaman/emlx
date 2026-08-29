@@ -47,13 +47,26 @@ defmodule EMLX.Quantization.ModuleTest do
       assert Nx.shape(cfg.biases) == {128, 2}
     end
 
-    test "raises on non-rank-2 tensor" do
-      weight = Nx.iota({2, 64, 64}, type: :f32)
+    test "raises on rank-1 tensor" do
+      weight = Nx.iota({64}, type: :f32)
       weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
 
-      assert_raise ArgumentError, ~r/rank-2/, fn ->
+      assert_raise ArgumentError, ~r/rank 2 or higher/, fn ->
         EMLX.quantize(weight, [])
       end
+    end
+
+    test "quantizes and dequantizes a rank-3 tensor" do
+      weight = Nx.iota({4, 32, 64}, type: :f32) |> Nx.divide(100)
+      weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
+
+      qw = EMLX.quantize(weight, [])
+
+      assert Nx.shape(qw) == {4, 32, 64}
+      assert Quantization.quantized?(qw)
+
+      dense = Quantization.dequantize(qw)
+      assert Nx.shape(dense) == {4, 32, 64}
     end
 
     test "raises when in_features not divisible by group_size" do
