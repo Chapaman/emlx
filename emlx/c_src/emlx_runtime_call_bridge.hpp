@@ -32,6 +32,8 @@
 #include "erl_nif.h"
 #include "mlx/allocator.h"
 #include "mlx/array.h"
+#include "mlx/ops.h"
+#include "mlx/transforms.h"
 #include "nx_nif_utils.hpp"
 
 #include <condition_variable>
@@ -164,7 +166,16 @@ inline void invoke_runtime_call(int64_t callback_index,
           "emlx::native: failed to allocate binary for runtime_call arg");
     }
     if (nbytes > 0) {
-      std::memcpy(bin.data, in.data<uint8_t>(), nbytes);
+      // Non-contiguous arrays (broadcast/transposed/sliced) hold fewer
+      // bytes than nbytes() in their buffer; materialise a contiguous copy
+      // first, same as to_blob_term's fallback.
+      if (in.flags().row_contiguous) {
+        std::memcpy(bin.data, in.data<uint8_t>(), nbytes);
+      } else {
+        auto contiguous_in = mlx::core::contiguous(in);
+        mlx::core::eval(contiguous_in);
+        std::memcpy(bin.data, contiguous_in.data<uint8_t>(), nbytes);
+      }
     }
     arg_terms.push_back(enif_make_binary(msg_env, &bin));
   }
