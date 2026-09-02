@@ -1,5 +1,10 @@
 import Config
 
+# Runtime bounds for the jit/compile eval-closure cache. Uncomment to cap
+# `:emlx_compile_closures`. Both default to :infinity. See config/dev.exs.
+# config :emlx, compile_cache_max_items: 1024
+# config :emlx, compile_cache_ttl: :timer.minutes(30)
+
 if config_env() == :test do
   config :emlx, :add_backend_on_inspect, false
 
