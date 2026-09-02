@@ -3,27 +3,39 @@ defmodule EMLX.CompileCache do
   Bounded ETS cache of `native_compile/3` eval closures.
 
   `EMLX.__compile__/4` stores one closure per `{fun, templates, hooks, device}`
-  key so repeated `Nx.Defn.jit/2` of the same call site skips retrace. The
-  table is unbounded unless the host application sets:
+  so repeated `Nx.Defn.jit/2` of the same call site skips retrace. Unbounded
+  unless the host sets:
 
       config :emlx, compile_cache_max_items: 1024
       config :emlx, compile_cache_ttl: :timer.minutes(30)
 
-  Both default to `:infinity`. Overflow evicts the oldest inserts (FIFO).
-  TTL is counted from insert time, not last access. Two concurrent misses
-  on the same key both compile; the later `put/4` wins.
+  Both default to `:infinity`. Overflow is FIFO by insert index. TTL is from
+  insert time and is swept by this process (`send_after(self(), :expire_entries,
+  div(ttl, 2))`), not on cache reads. A sweeper that is already running re-reads
+  app env each tick; if TTL is `:infinity` at start, nothing is scheduled until
+  the process restarts.
 
-  Evicting a closure does **not** free the compiled MLX program held in
-  `:emlx_native_dispatch_cache`.
+  The structural program table `:emlx_native_dispatch_cache` is shared across
+  call sites and is not bounded by these knobs.
   """
 
+  use GenServer
+
   @table :emlx_compile_closures
+  @counter :__counter__
 
   @doc false
   def table, do: @table
 
   @doc false
-  def init(table \\ @table) do
+  def start_link(opts \\ []) do
+    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+    _ = current_ttl(%{ttl: Keyword.get(opts, :ttl)})
+    GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  @doc false
+  def ensure_table(table \\ @table) when is_atom(table) do
     case :ets.whereis(table) do
       :undefined ->
         :ets.new(table, [
@@ -37,6 +49,8 @@ defmodule EMLX.CompileCache do
       _ ->
         :ok
     end
+
+    table
   end
 
   @doc false
@@ -48,34 +62,81 @@ defmodule EMLX.CompileCache do
   end
 
   @doc false
-  def fetch(table, key, opts) do
-    ttl = bound!(opts, :ttl)
-    # Validate both knobs on fetch and put so a bad config fails at first use.
-    _max_items = bound!(opts, :max_items)
-
+  def fetch(table \\ @table, key) do
     case :ets.lookup(table, key) do
-      [{^key, fun, inserted_ms}] ->
-        if expired?(inserted_ms, ttl) do
-          :ets.delete(table, key)
-          :miss
-        else
-          {:ok, fun}
-        end
-
-      [] ->
-        :miss
+      [{^key, fun, _inserted_ms, _index}] -> {:ok, fun}
+      _ -> {:error, :cache_miss}
     end
   end
 
   @doc false
-  def put(table, key, fun, opts) do
+  def put(table \\ @table, key, fun, opts) do
     max_items = bound!(opts, :max_items)
-    _ttl = bound!(opts, :ttl)
-
-    :ets.insert(table, {key, fun, System.monotonic_time(:millisecond)})
-    evict_overflow(table, max_items)
+    index = :ets.update_counter(table, @counter, 1, {@counter, 0})
+    :ets.insert(table, {key, fun, System.monotonic_time(:millisecond), index})
+    evict_overflow(table, max_items, index)
     fun
   end
+
+  @doc false
+  def expire_entries(_table, :infinity), do: 0
+
+  def expire_entries(table, ttl) when is_integer(ttl) and ttl > 0 do
+    cutoff = System.monotonic_time(:millisecond) - ttl
+
+    :ets.select_delete(table, [
+      {{:"$1", :_, :"$2", :_}, [{:"=<", :"$2", cutoff}], [true]}
+    ])
+  end
+
+  @impl true
+  def init(opts) do
+    table = Keyword.get(opts, :table) || ensure_table(@table)
+    ttl = Keyword.get(opts, :ttl)
+    {:ok, schedule_expire(%{table: table, ttl: ttl})}
+  end
+
+  @impl true
+  def handle_info(:expire_entries, state) do
+    case current_ttl(state) do
+      :infinity ->
+        {:noreply, state}
+
+      ttl ->
+        expire_entries(state.table, ttl)
+        {:noreply, schedule_expire(state)}
+    end
+  end
+
+  defp current_ttl(%{ttl: ttl}) when ttl != nil, do: bound_ttl!(ttl)
+  defp current_ttl(_state), do: bound!(opts(), :ttl)
+
+  defp schedule_expire(state) do
+    case current_ttl(state) do
+      :infinity ->
+        state
+
+      ttl ->
+        Process.send_after(self(), :expire_entries, max(div(ttl, 2), 1))
+        state
+    end
+  end
+
+  defp evict_overflow(_table, :infinity, _index), do: :ok
+
+  defp evict_overflow(table, max_items, index) do
+    cutoff = index - max_items
+
+    if cutoff > 0 do
+      :ets.select_delete(table, [
+        {{:"$1", :_, :_, :"$2"}, [{:"=<", :"$2", cutoff}], [true]}
+      ])
+    else
+      :ok
+    end
+  end
+
+  defp bound_ttl!(ttl), do: bound!([ttl: ttl], :ttl)
 
   defp bound!(opts, key) do
     case Keyword.get(opts, key, :infinity) do
@@ -93,28 +154,4 @@ defmodule EMLX.CompileCache do
 
   defp env_key(:max_items), do: :compile_cache_max_items
   defp env_key(:ttl), do: :compile_cache_ttl
-
-  defp expired?(_inserted_ms, :infinity), do: false
-
-  defp expired?(inserted_ms, ttl) do
-    System.monotonic_time(:millisecond) - inserted_ms >= ttl
-  end
-
-  defp evict_overflow(_table, :infinity), do: :ok
-
-  defp evict_overflow(table, max_items) do
-    overflow = :ets.info(table, :size) - max_items
-
-    if overflow > 0 do
-      oldest_keys =
-        :ets.foldl(fn {key, _fun, ms}, acc -> [{ms, key} | acc] end, [], table)
-        |> Enum.sort_by(&elem(&1, 0))
-        |> Enum.take(overflow)
-        |> Enum.map(&elem(&1, 1))
-
-      Enum.each(oldest_keys, &:ets.delete(table, &1))
-    else
-      :ok
-    end
-  end
 end

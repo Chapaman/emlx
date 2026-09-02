@@ -70,8 +70,7 @@ config :emlx, compile_cache_ttl: :timer.minutes(30)  # milliseconds, or :infinit
 ```
 
 Overflow drops the oldest inserts. TTL is counted from insert time, not last
-access. Evicting a closure does not free the compiled MLX program in the
-native dispatch cache. See the [EMLX moduledoc](https://hexdocs.pm/emlx/EMLX.html#module-compile-once-replay-many-times).
+access. See `EMLX.CompileCache`.
 
 ### Compile-time debug flags
 

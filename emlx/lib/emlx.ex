@@ -169,21 +169,8 @@ defmodule EMLX do
   distinct call sites (e.g. many copies of the same layer in a model) cheap
   too — but a caller-held `Nx.Defn.compile/3` closure is always cheaper still.
 
-  ### Compile-closure cache bounds
-
-  `:emlx_compile_closures` is unbounded by default. Long-running serving can
-  cap it at runtime (not `compile_env` — no recompile needed):
-
-      config :emlx, compile_cache_max_items: 1024
-      config :emlx, compile_cache_ttl: :timer.minutes(30)
-
-  Both accept `:infinity` (the default) or a positive integer. TTL is in
-  milliseconds, counted from insert time — a hit does not refresh it.
-  Overflow evicts the oldest inserts (FIFO). Two concurrent misses on the
-  same key both compile; the later insert wins.
-
-  Evicting a closure does **not** free the compiled MLX program in
-  `:emlx_native_dispatch_cache`. See `EMLX.CompileCache`.
+  Cache bounds (`:compile_cache_max_items`, `:compile_cache_ttl`) are
+  documented on `EMLX.CompileCache`.
 
   ## Compile-time debug flags
 
@@ -1870,7 +1857,7 @@ defmodule EMLX do
 
   @doc false
   def init do
-    EMLX.CompileCache.init()
+    EMLX.CompileCache.ensure_table()
   end
 
   @impl Nx.Defn.Compiler
@@ -1907,16 +1894,21 @@ defmodule EMLX do
     device = Keyword.get(opts, :device, default_device())
 
     cache_key = compile_cache_key(key, vars, hooks, device)
-    cache_opts = EMLX.CompileCache.opts()
 
     eval_fn =
-      case EMLX.CompileCache.fetch(EMLX.CompileCache.table(), cache_key, cache_opts) do
+      case EMLX.CompileCache.fetch(EMLX.CompileCache.table(), cache_key) do
         {:ok, cached} ->
           cached
 
-        :miss ->
+        {:error, :cache_miss} ->
           built = native_compile(vars, fun, device)
-          EMLX.CompileCache.put(EMLX.CompileCache.table(), cache_key, built, cache_opts)
+
+          EMLX.CompileCache.put(
+            EMLX.CompileCache.table(),
+            cache_key,
+            built,
+            EMLX.CompileCache.opts()
+          )
       end
 
     wrap_with_queue(queue, eval_fn)

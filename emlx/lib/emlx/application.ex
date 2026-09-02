@@ -52,7 +52,7 @@ defmodule EMLX.Application do
     ensure_default_worker!(:gpu, _gpu_optional? = true)
     ensure_worker!(:runtime_call_worker, :cpu, _gpu_optional? = false)
     ensure_worker!(:runtime_call_worker, :gpu, _gpu_optional? = true)
-    Supervisor.start_link([], strategy: :one_for_one, name: __MODULE__)
+    Supervisor.start_link([EMLX.CompileCache], strategy: :one_for_one, name: __MODULE__)
   end
 
   @doc """
