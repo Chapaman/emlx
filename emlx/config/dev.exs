@@ -26,10 +26,3 @@ import Config
 # happen in a working compiler and the checks add wasted work on the hot
 # compile-cache-miss path.
 # config :emlx, compiler_debug: true
-
-# Runtime bounds for `:emlx_compile_closures` (the jit/compile eval-closure
-# cache). Both default to :infinity. TTL is milliseconds from insert time;
-# overflow evicts oldest inserts. Evicting a closure does not free the
-# compiled program in `:emlx_native_dispatch_cache`.
-# config :emlx, compile_cache_max_items: 1024
-# config :emlx, compile_cache_ttl: :timer.minutes(30)
