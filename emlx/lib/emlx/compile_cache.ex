@@ -25,10 +25,22 @@ defmodule EMLX.CompileCache do
   @doc false
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
-    state_opts = %{ttl: Keyword.get(opts, :ttl), max_items: Keyword.get(opts, :max_items)}
-    _ = current_ttl(state_opts)
-    _ = current_max_items(state_opts)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    opts = Keyword.validate!(opts, [:ttl, :max_items])
+    gen_opts = if name, do: [name: name], else: []
+    GenServer.start_link(__MODULE__, opts, gen_opts)
+  end
+
+  @impl true
+  def init(opts) do
+    state = %{
+      table: :ets.new(:emlx_compile_closures, [:set, :private]),
+      counter: 0,
+      ttl: Keyword.get(opts, :ttl),
+      max_items: Keyword.get(opts, :max_items)
+    }
+
+    _ = current_max_items(state)
+    {:ok, schedule_expire(state)}
   end
 
   @doc false
@@ -39,20 +51,6 @@ defmodule EMLX.CompileCache do
   @doc false
   def put(key, fun, server \\ __MODULE__) do
     GenServer.call(server, {:put, key, fun})
-  end
-
-  @impl true
-  def init(opts) do
-    table = :ets.new(:emlx_compile_closures, [:set, :private])
-
-    state = %{
-      table: table,
-      counter: 0,
-      ttl: Keyword.get(opts, :ttl),
-      max_items: Keyword.get(opts, :max_items)
-    }
-
-    {:ok, schedule_expire(state)}
   end
 
   @impl true
