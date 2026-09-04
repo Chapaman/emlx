@@ -1,13 +1,14 @@
 defmodule EMLX.CompileCache do
   @moduledoc """
-  Bounded ETS cache of `native_compile/3` eval closures.
+  Bounded cache of `native_compile/3` eval closures.
 
   `EMLX.__compile__/4` stores one closure per `{fun, templates, hooks, device}`
   so repeated `Nx.Defn.jit/2` of the same call site skips retrace. Unbounded
   unless the host sets:
 
-      config :emlx, compile_cache_max_items: 1024
-      config :emlx, compile_cache_ttl: :timer.minutes(30)
+      config :emlx, EMLX.CompileCache,
+        max_items: 1024,
+        ttl: :timer.minutes(30)
 
   Both default to `:infinity`. Overflow is FIFO by insert index. TTL is from
   insert time and is swept by this process (`send_after(self(), :expire_entries,
@@ -21,79 +22,55 @@ defmodule EMLX.CompileCache do
 
   use GenServer
 
-  @table :emlx_compile_closures
-  @counter :__counter__
-
-  @doc false
-  def table, do: @table
-
   @doc false
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
-    _ = current_ttl(%{ttl: Keyword.get(opts, :ttl)})
+    state_opts = %{ttl: Keyword.get(opts, :ttl), max_items: Keyword.get(opts, :max_items)}
+    _ = current_ttl(state_opts)
+    _ = current_max_items(state_opts)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc false
-  def ensure_table(table \\ @table) when is_atom(table) do
-    case :ets.whereis(table) do
-      :undefined ->
-        :ets.new(table, [
-          :named_table,
-          :public,
-          :set,
-          read_concurrency: true,
-          write_concurrency: true
-        ])
-
-      _ ->
-        :ok
-    end
-
-    table
+  def fetch(key, server \\ __MODULE__) do
+    GenServer.call(server, {:fetch, key})
   end
 
   @doc false
-  def opts do
-    [
-      max_items: Application.get_env(:emlx, :compile_cache_max_items, :infinity),
-      ttl: Application.get_env(:emlx, :compile_cache_ttl, :infinity)
-    ]
-  end
-
-  @doc false
-  def fetch(table \\ @table, key) do
-    case :ets.lookup(table, key) do
-      [{^key, fun, _inserted_ms, _index}] -> {:ok, fun}
-      _ -> {:error, :cache_miss}
-    end
-  end
-
-  @doc false
-  def put(table \\ @table, key, fun, opts) do
-    max_items = bound!(opts, :max_items)
-    index = :ets.update_counter(table, @counter, 1, {@counter, 0})
-    :ets.insert(table, {key, fun, System.monotonic_time(:millisecond), index})
-    evict_overflow(table, max_items, index)
-    fun
-  end
-
-  @doc false
-  def expire_entries(_table, :infinity), do: 0
-
-  def expire_entries(table, ttl) when is_integer(ttl) and ttl > 0 do
-    cutoff = System.monotonic_time(:millisecond) - ttl
-
-    :ets.select_delete(table, [
-      {{:"$1", :_, :"$2", :_}, [{:"=<", :"$2", cutoff}], [true]}
-    ])
+  def put(key, fun, server \\ __MODULE__) do
+    GenServer.call(server, {:put, key, fun})
   end
 
   @impl true
   def init(opts) do
-    table = Keyword.get(opts, :table) || ensure_table(@table)
-    ttl = Keyword.get(opts, :ttl)
-    {:ok, schedule_expire(%{table: table, ttl: ttl})}
+    table = :ets.new(:emlx_compile_closures, [:set, :private])
+
+    state = %{
+      table: table,
+      counter: 0,
+      ttl: Keyword.get(opts, :ttl),
+      max_items: Keyword.get(opts, :max_items)
+    }
+
+    {:ok, schedule_expire(state)}
+  end
+
+  @impl true
+  def handle_call({:fetch, key}, _from, %{table: table} = state) do
+    reply =
+      case :ets.lookup(table, key) do
+        [{^key, fun, _inserted_ms, _index}] -> {:ok, fun}
+        [] -> {:error, :cache_miss}
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:put, key, fun}, _from, state) do
+    index = state.counter + 1
+    :ets.insert(state.table, {key, fun, System.monotonic_time(:millisecond), index})
+    evict_overflow(state.table, current_max_items(state), index)
+    {:reply, fun, %{state | counter: index}}
   end
 
   @impl true
@@ -108,8 +85,25 @@ defmodule EMLX.CompileCache do
     end
   end
 
-  defp current_ttl(%{ttl: ttl}) when ttl != nil, do: bound_ttl!(ttl)
-  defp current_ttl(_state), do: bound!(opts(), :ttl)
+  defp expire_entries(table, ttl) do
+    cutoff = System.monotonic_time(:millisecond) - ttl
+
+    :ets.select_delete(table, [
+      {{:"$1", :_, :"$2", :_}, [{:"=<", :"$2", cutoff}], [true]}
+    ])
+  end
+
+  defp current_ttl(%{ttl: ttl}) when ttl != nil, do: bound!(ttl, :ttl)
+  defp current_ttl(_state), do: bound!(config(:ttl), :ttl)
+
+  defp current_max_items(%{max_items: n}) when n != nil, do: bound!(n, :max_items)
+  defp current_max_items(_state), do: bound!(config(:max_items), :max_items)
+
+  defp config(key) do
+    :emlx
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(key, :infinity)
+  end
 
   defp schedule_expire(state) do
     case current_ttl(state) do
@@ -136,22 +130,11 @@ defmodule EMLX.CompileCache do
     end
   end
 
-  defp bound_ttl!(ttl), do: bound!([ttl: ttl], :ttl)
+  defp bound!(:infinity, _key), do: :infinity
+  defp bound!(n, _key) when is_integer(n) and n > 0, do: n
 
-  defp bound!(opts, key) do
-    case Keyword.get(opts, key, :infinity) do
-      :infinity ->
-        :infinity
-
-      n when is_integer(n) and n > 0 ->
-        n
-
-      other ->
-        raise ArgumentError,
-              "config :emlx, #{env_key(key)} must be :infinity or a positive integer, got: #{inspect(other)}"
-    end
+  defp bound!(other, key) do
+    raise ArgumentError,
+          "config :emlx, #{inspect(__MODULE__)}, #{key} must be :infinity or a positive integer, got: #{inspect(other)}"
   end
-
-  defp env_key(:max_items), do: :compile_cache_max_items
-  defp env_key(:ttl), do: :compile_cache_ttl
 end

@@ -60,18 +60,6 @@ Nx.Defn.default_options(compiler: EMLX)
 config :nx, :default_defn_options, compiler: EMLX
 ```
 
-EMLX caches jit/compile closures in an ETS table so repeated calls of the same
-function and shapes skip retrace. The table is unbounded by default. For a
-long-running serving process you can cap it:
-
-```elixir
-config :emlx, compile_cache_max_items: 1024          # or :infinity
-config :emlx, compile_cache_ttl: :timer.minutes(30)  # milliseconds, or :infinity
-```
-
-Overflow drops the oldest inserts. TTL is counted from insert time, not last
-access. See `EMLX.CompileCache`.
-
 ### Compile-time debug flags
 
 Development-only assertion flags (`:enable_bounds_check`, `:detect_non_finites`,

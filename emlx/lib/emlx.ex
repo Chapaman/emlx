@@ -148,7 +148,7 @@ defmodule EMLX do
 
   `Nx.Defn.jit/2` and `Nx.Defn.jit_apply/3` still retrace through Nx on every
   call, but `EMLX.__compile__/4` caches the resulting eval closure in
-  `:emlx_compile_closures`, keyed by function identity, input templates, and
+  `EMLX.CompileCache`, keyed by function identity, input templates, and
   device. Repeated jit of the same `&Mod.f/a` with the same shapes hits that
   cache and skips `native_compile/3`.
 
@@ -169,8 +169,7 @@ defmodule EMLX do
   distinct call sites (e.g. many copies of the same layer in a model) cheap
   too — but a caller-held `Nx.Defn.compile/3` closure is always cheaper still.
 
-  Cache bounds (`:compile_cache_max_items`, `:compile_cache_ttl`) are
-  documented on `EMLX.CompileCache`.
+  Cache bounds are documented on `EMLX.CompileCache`.
 
   ## Compile-time debug flags
 
@@ -1855,11 +1854,6 @@ defmodule EMLX do
   # Expr-id cache in front of `dispatch_key/3`.
   @dispatch_key_by_id_table :emlx_dispatch_key_by_id
 
-  @doc false
-  def init do
-    EMLX.CompileCache.ensure_table()
-  end
-
   @impl Nx.Defn.Compiler
   def __jit__(key, vars, fun, args_list, opts) do
     __compile__(key, vars, fun, opts).(args_list)
@@ -1896,19 +1890,13 @@ defmodule EMLX do
     cache_key = compile_cache_key(key, vars, hooks, device)
 
     eval_fn =
-      case EMLX.CompileCache.fetch(EMLX.CompileCache.table(), cache_key) do
+      case EMLX.CompileCache.fetch(cache_key) do
         {:ok, cached} ->
           cached
 
         {:error, :cache_miss} ->
           built = native_compile(vars, fun, device)
-
-          EMLX.CompileCache.put(
-            EMLX.CompileCache.table(),
-            cache_key,
-            built,
-            EMLX.CompileCache.opts()
-          )
+          EMLX.CompileCache.put(cache_key, built)
       end
 
     wrap_with_queue(queue, eval_fn)
